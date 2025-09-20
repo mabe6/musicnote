@@ -37,7 +37,8 @@ NOTE_MAX = 57
 # ---------------- Globals ----------------
 note_positions = {note: [] for note in NOTE_NAMES}   # captured positions per note name
 required_counts = {note: 0 for note in NOTE_NAMES}
-delay_grid = {"top_left": None, "top_right": None, "bottom_right": None, "bottom_left": None}
+delay_grid = {"top_left": None, "bottom_right": None}
+
 
 overlay_window = None
 overlay_canvas = None
@@ -346,9 +347,15 @@ def update_overlay():
         return
 
     tlp = delay_grid.get("top_left")
-    trp = delay_grid.get("top_right") or (br[0], tlp[1])
     brp = delay_grid.get("bottom_right")
-    blp = delay_grid.get("bottom_left") or (tlp[0], brp[1])
+    # jeśli któregokolwiek brakuje, przerwij (już masz warunek wcześniej, ale dodatkowe zabezpieczenie)
+    if not tlp or not brp:
+        return
+
+    # oblicz współrzędne pozostałych narożników prostokąta:
+    trp = (brp[0], tlp[1])  # top-right: x z bottom-right, y z top-left
+    blp = (tlp[0], brp[1])  # bottom-left: x z top_left, y z bottom_right
+
 
     pts = [tlp, trp, brp, blp]
     xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
@@ -438,25 +445,21 @@ def update_overlay():
 
         # FIXED SKEW IMPLEMENTATION (matching the old working code)
         # Calculate normalized distance from center (-1 to 1)
-        if cols > 1:
-            norm_x = (col - (cols - 1) / 2.0) / ((cols - 1) / 2.0)
+        # PIXEL-BASED SKEW (same as overlay)
+        center_x = width / 2.0
+        center_y = height / 2.0
+        if center_x != 0:
+              dx = (x_local - center_x) / center_x
         else:
-            norm_x = 0
-            
-        if rows > 1:
-            norm_y = (row - (rows - 1) / 2.0) / ((rows - 1) / 2.0)
+              dx = 0.0
+        if center_y != 0:
+              dy = (y_local - center_y) / center_y
         else:
-            norm_y = 0
+              dy = 0.0
 
-        # Apply radial skew effect with proper scale factor
-        # The farther from center, the more the skew affects the position
-        # Scale factor of 100 matches the old working code
-        skew_offset_x = norm_x * skew_x * width * 100
-        skew_offset_y = norm_y * skew_y * height * 100
-        
-        # Apply skew offsets
-        x_local = x_local + skew_offset_x
-        y_local = y_local + skew_offset_y
+        x_local = x_local + dx * skew_x * center_x
+        y_local = y_local + dy * skew_y * center_y
+
 
         if not (math.isfinite(x_local) and math.isfinite(y_local)):
             continue
@@ -525,11 +528,6 @@ def toggle_overlay():
         try: overlay_status_var.set("Overlay: hidden")
         except Exception: pass
 
-def preview_grid():
-    create_overlay(preview=True)
-    try: overlay_status_var.set("Overlay: preview")
-    except Exception: pass
-
 # ---------------- SendInput wrapper (mouse) ----------------
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
@@ -597,41 +595,11 @@ def move_smooth_to(x_target, y_target):
     ax, ay = to_absolute_coords(x_target, y_target)
     _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
 
-def perform_wiggle_at(xc, yc, radius_px=None):
-    """Perform a very small circular wiggle around (xc,yc) and return to center.
-       Radius default taken from wiggle_radius_var. This ensures we end exactly on the spot.
-    """
-    try:
-        if radius_px is None:
-            radius_px = int(wiggle_radius_var.get())
-    except Exception:
-        radius_px = 1
-    # short wiggle timing based on move_duration to keep it quick but noticeable
-    try:
-        wiggle_total_ms = max(6.0, float(move_duration_var.get()) * 0.25)
-    except Exception:
-        wiggle_total_ms = 12.0
-    wiggle_total_s = wiggle_total_ms / 1000.0
-    if radius_px <= 0:
-        return
-    n = 6
-    per = max(0.001, wiggle_total_s / (n + 1))
-    for i in range(n):
-        theta = (2.0 * math.pi) * (i / n)
-        xi = xc + radius_px * math.cos(theta)
-        yi = yc + radius_px * math.sin(theta)
-        ax, ay = to_absolute_coords(xi, yi)
-        _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
-        time.sleep(per)
-    # return precisely to center
-    axc, ayc = to_absolute_coords(xc, yc)
-    _send_input_mouse(axc, ayc, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
-    time.sleep(max(0.001, per/2))
+
 
 def move_and_click_abs(x, y, pause_before_click=0.006):
     try:
         move_smooth_to(x, y)
-        perform_wiggle_at(x, y)
         time.sleep(pause_before_click)
         _send_input_mouse(0, 0, MOUSEEVENTF_LEFTDOWN)
         time.sleep(0.010)
@@ -834,10 +802,11 @@ for i, note in enumerate(NOTE_NAMES):
 corner_frame = tk.Frame(root)
 corner_frame.pack(fill="x", padx=6, pady=(4,0))
 corner_buttons = {}
-for corner in ["top_left","top_right","bottom_right","bottom_left"]:
-    btn = tk.Button(corner_frame, text=corner.replace("_"," ").title(), width=12, command=lambda c=corner: capture_grid_corner(c))
-    btn.pack(side="left", padx=3)
+for corner in ["top_left","bottom_right"]:
+    btn = tk.Button(corner_frame, text=corner.replace("_"," ").title(), width=14, command=lambda c=corner: capture_grid_corner(c))
+    btn.pack(side="left", padx=6)
     corner_buttons[corner] = btn
+
 
 # Controls row (compact)
 controls = tk.Frame(root)
@@ -848,9 +817,6 @@ load_btn.pack(side="left", padx=4)
 
 show_grid_btn = tk.Button(controls, text="Show Grid", width=10, command=toggle_overlay)
 show_grid_btn.pack(side="left", padx=4)
-
-preview_btn = tk.Button(controls, text="Preview Grid", width=10, command=preview_grid)
-preview_btn.pack(side="left", padx=4)
 
 # grid settings compact
 cols_entry = tk.Entry(controls, width=4)
@@ -870,7 +836,6 @@ apply_grid_btn.pack(side="left", padx=6)
 # dot size + movement controls (compact)
 
 dot_size_var = tk.IntVar(value=2)
-wiggle_radius_var = tk.IntVar(value=1)  # default 1 px wiggle radius
 move_step_var = tk.IntVar(value=6)
 step_delay_var = tk.DoubleVar(value=20.0)  # default 20 ms per step
 move_duration_var = tk.DoubleVar(value=60.0)  # Initialize the missing variable
@@ -895,13 +860,32 @@ tk.Label(ctrl2, text="Step delay(ms):").pack(side="left", padx=(8,0))
 step_delay_spin = tk.Spinbox(ctrl2, from_=0.1, to=50.0, increment=0.1, width=6, textvariable=step_delay_var)
 step_delay_spin.pack(side="left", padx=4)
 
-tk.Label(ctrl2, text="Wiggle px:").pack(side="left", padx=(8,0))
-wiggle_radius_spin = tk.Spinbox(ctrl2, from_=0, to=12, width=4, textvariable=wiggle_radius_var)
-wiggle_radius_spin.pack(side="left", padx=4)
-
 # Skew controls (small)
 skew_frame = tk.Frame(root)
 skew_frame.pack(fill="x", padx=6, pady=(6,4))
+
+# Always on top flag for main window and overlay
+always_on_top_var = tk.BooleanVar(value=False)
+
+def set_always_on_top():
+    val = bool(always_on_top_var.get())
+    # main window
+    try:
+        root.attributes("-topmost", val)
+    except Exception:
+        pass
+    # overlay window (jeśli istnieje)
+    try:
+        if overlay_window is not None:
+            overlay_window.attributes("-topmost", val)
+    except Exception:
+        pass
+
+# dodaj to np. w ctrl2 obok innych kontrolek
+always_chk = tk.Checkbutton(ctrl2, text="Always on top", variable=always_on_top_var,
+                            onvalue=True, offvalue=False, command=set_always_on_top)
+always_chk.pack(side="left", padx=(8,4))
+
 
 # Use DoubleVar to hold numeric values; entries display formatted 0.00 and buttons adjust by 0.01
 skew_x_var = tk.DoubleVar(value=0.0)
@@ -911,6 +895,13 @@ tk.Label(skew_frame, text="Skew X").pack(side="left")
 skew_x_entry = tk.Entry(skew_frame, width=8)
 skew_x_entry.pack(side="left", padx=6)
 skew_x_entry.insert(0, "0.00")
+
+# zamiast stałego True ustaw wartość z checkboxa
+try:
+    overlay_window.attributes("-topmost", bool(always_on_top_var.get()))
+except Exception:
+    pass
+
 
 def apply_skew_x(e=None):
     try:
