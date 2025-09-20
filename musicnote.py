@@ -723,6 +723,7 @@ def move_and_click_abs(x, y, pause_before_click=0.006):
 
 def compute_screen_coords_for_tick(tick_index):
     global last_overlay_mapping
+    # If we don't have an overlay mapping, fall back to a simple grid math
     if last_overlay_mapping is None:
         tl = delay_grid.get("top_left"); br = delay_grid.get("bottom_right")
         if not tl or not br:
@@ -731,8 +732,8 @@ def compute_screen_coords_for_tick(tick_index):
         if x2 < x1: x1, x2 = x2, x1
         if y2 < y1: y1, y2 = y2, y1
         width = max(1, x2 - x1); height = max(1, y2 - y1)
-        cols = columns_override or 1
-        rows = rows_override or max(1, math.ceil(song_ticks / cols)) if cols > 0 else 1
+        cols = columns_override if columns_override is not None else 1
+        rows = rows_override if rows_override is not None else max(1, math.ceil(song_ticks / cols)) if cols > 0 else 1
         col = tick_index % cols
         row = tick_index // cols
         cell_w = width / max(cols, 1)
@@ -741,6 +742,7 @@ def compute_screen_coords_for_tick(tick_index):
         cy = y1 + row * cell_h + cell_h / 2.0
         return cx, cy
 
+    # Use the overlay mapping (homography + same pixel-based skew as overlay)
     H = last_overlay_mapping['H']
     cols = last_overlay_mapping['cols']; rows = last_overlay_mapping['rows']
     cell_w = last_overlay_mapping['cell_w']; cell_h = last_overlay_mapping['cell_h']
@@ -753,35 +755,39 @@ def compute_screen_coords_for_tick(tick_index):
     sy = (row + 0.5) * cell_h
     x_local, y_local = apply_homography(H, sx, sy)
 
-    # Apply the SAME FIXED skew calculation as in update_overlay
+    # Apply the SAME FIXED skew calculation as in update_overlay (pixel-based)
     try:
         skew_x = float(skew_x_var.get())
         skew_y = float(skew_y_var.get())
     except Exception:
         skew_x = 0.0
         skew_y = 0.0
-        
-    # Calculate normalized distance from center (-1 to 1)
-    if cols > 1:
-        norm_x = (col - (cols - 1) / 2.0) / ((cols - 1) / 2.0)
-    else:
-        norm_x = 0
-        
-    if rows > 1:
-        norm_y = (row - (rows - 1) / 2.0) / ((rows - 1) / 2.0)
-    else:
-        norm_y = 0
 
-    # Apply radial skew effect with proper scale factor (matching overlay)
-    skew_offset_x = norm_x * skew_x * width * 100
-    skew_offset_y = norm_y * skew_y * height * 100
-    
-    x_local = x_local + skew_offset_x
-    y_local = y_local + skew_offset_y
+    center_x = width / 2.0
+    center_y = height / 2.0
+    if center_x != 0:
+        dx = (x_local - center_x) / center_x
+    else:
+        dx = 0.0
+    if center_y != 0:
+        dy = (y_local - center_y) / center_y
+    else:
+        dy = 0.0
+
+    # Use pixel-scale skew (matches overlay)
+    x_local = x_local + dx * skew_x * center_x
+    y_local = y_local + dy * skew_y * center_y
 
     abs_x = origin_x + x_local
     abs_y = origin_y + y_local
+
+    # Optional safety clamp: keep inside primary screen bounds
+    sx_screen, sy_screen = get_screen_size()
+    abs_x = max(0.0, min(abs_x, sx_screen - 1.0))
+    abs_y = max(0.0, min(abs_y, sy_screen - 1.0))
+
     return abs_x, abs_y
+
 
 # ---------------- Play logic ----------------
 def _stop_listener():
