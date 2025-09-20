@@ -11,7 +11,6 @@ import keyboard
 import math
 import numpy as np
 import time
-
 # ---------------- Windows constants ----------------
 GWL_EXSTYLE = -20
 WS_EX_LAYERED     = 0x00080000
@@ -35,11 +34,23 @@ NOTE_MIN = 33
 NOTE_MAX = 57
 
 # ---------------- Globals ----------------
+# Note positions and required counts
 note_positions = {note: [] for note in NOTE_NAMES}   # captured positions per note name
 required_counts = {note: 0 for note in NOTE_NAMES}
+
+# Delay grid configuration
 delay_grid = {"top_left": None, "bottom_right": None}
 
+# Armed note (single): name of the note currently armed, or None
+armed_note = None
 
+# Lock to protect armed_note and note_positions changes
+armed_lock = threading.Lock()
+
+# Flag used to indicate we're currently waiting for a grid corner (so armed handler ignores F6)
+capturing_grid_corner = False
+
+# Overlay-related globals
 overlay_window = None
 overlay_canvas = None
 overlay_transparent_supported = False
@@ -252,29 +263,126 @@ def load_nbs():
 
 # ---------------- Capture handlers ----------------
 def capture_note_position(note):
-    note_buttons[note].config(text=f"{note}: Waiting...")
-    def wait_f6():
-        keyboard.wait("f6")
-        x, y = get_cursor_pos()
-        note_positions.setdefault(note, []).append((x, y))
-        have = len(note_positions[note]); need = required_counts.get(note, 0)
-        if need > 0:
-            note_buttons[note].config(text=f"{note}: {have}/{need}")
+    """
+    Toggle armed state for a note.
+    - If note was not armed: arm it (disarm any previous), update label to 'Armed ...'
+    - If note was armed: disarm it and update label back to have/need
+    Press F6 to capture while the note is armed.
+    """
+    global armed_note
+    prev = None
+    with armed_lock:
+        if armed_note == note:
+            # disarm
+            armed_note = None
+            prev = None
         else:
-            note_buttons[note].config(text=f"{note}: {have}")
-        output_text.insert(tk.END, f"Captured {note} at ({x},{y}) _ total {have}\n")
-    threading.Thread(target=wait_f6, daemon=True).start()
+            prev = armed_note
+            armed_note = note
+
+    # update UI for previous (disarm) and current (armed or normal)
+    def _update_labels():
+        # previous note (if exists) -> set normal label
+        if prev and prev in note_buttons:
+            have_prev = len(note_positions.get(prev, []))
+            need_prev = required_counts.get(prev, 0)
+            if need_prev > 0:
+                note_buttons[prev].config(text=f"{prev}: {have_prev}/{need_prev}")
+            else:
+                note_buttons[prev].config(text=f"{prev}: {have_prev}")
+
+        # current note
+        have = len(note_positions.get(note, []))
+        need = required_counts.get(note, 0)
+        # If we just armed it:
+        with armed_lock:
+            is_armed = (armed_note == note)
+        if is_armed:
+            if need > 0:
+                note_buttons[note].config(text=f"{note}: Armed {have}/{need}")
+            else:
+                note_buttons[note].config(text=f"{note}: Armed {have}")
+            output_text.insert(tk.END, f"{note} armed. Press F6 to capture positions; click note to cancel.\n")
+        else:
+            if need > 0:
+                note_buttons[note].config(text=f"{note}: {have}/{need}")
+            else:
+                note_buttons[note].config(text=f"{note}: {have}")
+            output_text.insert(tk.END, f"{note} disarmed.\n")
+
+    root.after(0, _update_labels)
+
 
 def capture_grid_corner(corner):
     btn = corner_buttons[corner]
     btn.config(text=f"{corner.replace('_',' ').title()}: Waiting...")
     def wait_f6():
+        global capturing_grid_corner
+        capturing_grid_corner = True
         keyboard.wait("f6")
         x, y = get_cursor_pos()
         delay_grid[corner] = (x, y)
+        capturing_grid_corner = False
         root.after(0, lambda: btn.config(text=f"{corner.replace('_',' ').title()}: ({x},{y})"))
         root.after(0, update_or_create_overlay)
     threading.Thread(target=wait_f6, daemon=True).start()
+
+def _f6_global_handler(evt):
+    global armed_note  # must be first line
+
+    if capturing_grid_corner:  # don't interfere if corner capture active
+        return
+
+    with armed_lock:
+        note = armed_note  # safe to read/write
+
+    if not note:
+        return
+
+    x, y = get_cursor_pos()
+    with armed_lock:
+        positions = note_positions.setdefault(note, [])
+        need = required_counts.get(note, 0)
+        have = len(positions)
+
+        if need > 0 and have >= need:
+            armed_note = None  # auto-disarm
+            root.after(0, lambda: note_buttons[note].config(text=f"{note}: {have}/{need}"))
+            root.after(0, lambda: output_text.insert(tk.END, f"Note {note} already has required captures ({have}). Auto-disarmed.\n"))
+            return
+
+        positions.append((x, y))
+        have += 1
+
+    # Update UI back in the main thread
+    def _ui_updates(x=x, y=y, note=note, have=have, need=need):
+        global armed_note  # Move this to the top of the function
+        
+        # If limit reached -> disarm and show normal label
+        if need > 0 and have >= need:
+            # Limit reached
+            try:
+                note_buttons[note].config(text=f"{note}: {have}/{need}")
+            except Exception:
+                pass
+            output_text.insert(tk.END, f"Captured {note} at ({x},{y}) — total {have}. Reached required captures; auto-disarmed.\n")
+            # Ensure armed state is reset
+            with armed_lock:
+                if armed_note == note:
+                    armed_note = None
+        else:
+            # Still armed (or no limit)
+            try:
+                if need > 0:
+                    note_buttons[note].config(text=f"{note}: Armed {have}/{need}")
+                else:
+                    note_buttons[note].config(text=f"{note}: Armed {have}")
+            except Exception:
+                pass
+            output_text.insert(tk.END, f"Captured {note} at ({x},{y}) - total {have}\n")
+
+    root.after(0, _ui_updates)
+
 
 # ---------------- Overlay ----------------
 def create_overlay(preview=False):
@@ -974,20 +1082,55 @@ status_label.pack(side="left", padx=6)
 play_button = tk.Button(root, text="Play Song", width=12, command=play_song)
 play_button.pack(side="right", padx=8, pady=6)
 
-# Bind F7 to stop in UI too
+# This section should be placed at the END of your script, 
+# right before root.mainloop()
+
+# ---------------- Register keyboard handlers ----------------
+# Register F6 handler for capturing note positions
+keyboard.on_press_key("f6", _f6_global_handler)
+
+# Register F7 handler for stopping playback
 def on_f7_press(e=None):
     global stop_play
     stop_play = True
+
 keyboard.on_press_key("f7", lambda e: on_f7_press())
 
-# Periodic overlay refresh
+# ---------------- Start periodic refresh and mainloop ----------------
 def periodic_refresh():
+    # update overlay if enabled
     if overlay_shown and overlay_window is not None:
         try:
             update_overlay()
         except Exception:
             pass
+
+    # update note button labels (armed / counts)
+    try:
+        with armed_lock:
+            armed = armed_note
+        for note, btn in note_buttons.items():
+            have = len(note_positions.get(note, []))
+            need = required_counts.get(note, 0)
+            if note == armed:
+                # show Armed label if this note is armed
+                if need > 0:
+                    btn.config(text=f"{note}: Armed {have}/{need}")
+                else:
+                    btn.config(text=f"{note}: Armed {have}")
+            else:
+                if need > 0:
+                    btn.config(text=f"{note}: {have}/{need}")
+                else:
+                    btn.config(text=f"{note}: {have}")
+    except Exception:
+        pass
+
+    # schedule next refresh
     root.after(200, periodic_refresh)
+
+# Start the periodic refresh loop
 root.after(200, periodic_refresh)
 
+# Start the GUI main loop
 root.mainloop()
