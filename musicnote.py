@@ -1,5 +1,10 @@
-# nbs_overlay_clicker_compact.py
-# Compact version of NBS Overlay Clicker with FIXED SKEW functionality
+# nbs_overlay_clicker_fixed.py
+# Optimized + fixes for: heavy-grid lag (e.g. 76x56) and clicking while overlay hidden
+# - Precomputes tick screen coordinates (homography + skew) once when grid/settings change
+# - Caches tick_positions so play loop does O(1) lookups when clicking delay cells
+# - Redraws overlay only when parameters actually change (overlay_dirty flag)
+# - Overlay can be hidden but mapping remains available for playback
+# - Minor micro-optimizations in update loop to avoid repeated expensive work
 
 import pynbs
 import tkinter as tk
@@ -11,6 +16,7 @@ import keyboard
 import math
 import numpy as np
 import time
+import random
 # ---------------- Windows constants ----------------
 GWL_EXSTYLE = -20
 WS_EX_LAYERED     = 0x00080000
@@ -62,7 +68,12 @@ notes_by_tick = {}
 tempo = 0.0
 stop_play = False
 last_overlay_mapping = None
-move_duration_var = None  # Initialize this global variable
+# Precomputed tick absolute positions (len = song_ticks) or None
+tick_positions = None
+# Dirty flag: set True when mapping/visuals need redraw
+overlay_dirty = True
+# Keep last-drawn params to avoid redrawing unchanged overlay
+_last_drawn_params = None
 
 # ---------------- Helpers ----------------
 def get_cursor_pos():
@@ -193,6 +204,99 @@ def compute_required_counts():
     except Exception:
         pass
 
+# ---------------- Mapping / caching (NEW) ----------------
+def update_mapping():
+    """Compute and cache the overlay homography, grid metrics and absolute tick positions.
+    This is the critical optimization: we precompute tick_positions once whenever the grid
+    and parameters change so the playback loop can do O(1) lookups and avoid recomputing
+    homography/apply/looping every click.
+    """
+    global last_overlay_mapping, tick_positions, overlay_dirty
+
+    tl = delay_grid.get("top_left"); br = delay_grid.get("bottom_right")
+    if not tl or not br or song_ticks <= 0:
+        last_overlay_mapping = None
+        tick_positions = None
+        overlay_dirty = True
+        return
+
+    x1, y1 = tl; x2, y2 = br
+    if x2 < x1: x1, x2 = x2, x1
+    if y2 < y1: y1, y2 = y2, y1
+    width = max(1, x2 - x1); height = max(1, y2 - y1)
+
+    cols = columns_override if columns_override is not None else compute_best_columns(width, height, song_ticks)
+    rows = rows_override if rows_override is not None else compute_best_rows(width, height, song_ticks)
+
+    # Build homography from local overlay coords to screen-space quad
+    tl_local = (0.0, 0.0)
+    tr_local = (float(width), 0.0)
+    br_local = (float(width), float(height))
+    bl_local = (0.0, float(height))
+    src_rect = [tl_local, tr_local, br_local, bl_local]
+    dst_quad = [ (tl[0] - x1, tl[1] - y1), (br[0] - x1, tl[1] - y1), (br[0] - x1, br[1] - y1), (tl[0] - x1, br[1] - y1) ]
+    H = compute_homography(src_rect, dst_quad)
+
+    # get origin screen coordinates (top-left of bounding rect)
+    origin_x = x1; origin_y = y1
+    cell_w = width / max(cols,1)
+    cell_h = height / max(rows,1)
+
+    # Read skew once
+    try:
+        skew_x = float(skew_x_var.get())
+        skew_y = float(skew_y_var.get())
+    except Exception:
+        skew_x = 0.0; skew_y = 0.0
+
+    positions = [None] * song_ticks
+    sx_screen, sy_screen = get_screen_size()
+    center_x = width / 2.0
+    center_y = height / 2.0
+
+    for i in range(song_ticks):
+        col = i % cols
+        row = i // cols
+        sx = (col + 0.5) * cell_w
+        sy = (row + 0.5) * cell_h
+        x_local, y_local = apply_homography(H, sx, sy)
+
+        # Apply pixel-based skew (same logic as overlay)
+        if center_x != 0:
+            dx = (x_local - center_x) / center_x
+        else:
+            dx = 0.0
+        if center_y != 0:
+            dy = (y_local - center_y) / center_y
+        else:
+            dy = 0.0
+        x_local = x_local + dx * skew_x * center_x
+        y_local = y_local + dy * skew_y * center_y
+
+        abs_x = origin_x + x_local
+        abs_y = origin_y + y_local
+
+        # clamp to primary screen
+        abs_x = max(0.0, min(abs_x, sx_screen - 1.0))
+        abs_y = max(0.0, min(abs_y, sy_screen - 1.0))
+        positions[i] = (abs_x, abs_y)
+
+    last_overlay_mapping = {
+        'H': H,
+        'cols': cols,
+        'rows': rows,
+        'cell_w': cell_w,
+        'cell_h': cell_h,
+        'origin_x': origin_x,
+        'origin_y': origin_y,
+        'width': width,
+        'height': height,
+        'min_x': x1,
+        'min_y': y1
+    }
+    tick_positions = positions
+    overlay_dirty = True
+
 # ---------------- NBS loader ----------------
 def load_nbs():
     global song_ticks, notes_by_tick, tempo
@@ -222,7 +326,7 @@ def load_nbs():
 
     output_text.delete(1.0, tk.END)
     output_text.insert(tk.END, f"Tempo: {tempo:.2f} ticks/sec\n")
-    output_text.insert(tk.END, f"Header ticks: {header_length}, derived ticks: {song_ticks}\n\n")
+    output_text.insert(tk.END, f"Header ticks: {header_length}, derived ticks: {song_ticks}\n")
     output_text.insert(tk.END, "Tick | Delay(s) | Notes (Layer, Instrument, NoteName)\n")
 
     prev_tick = 0
@@ -241,25 +345,10 @@ def load_nbs():
 
     compute_required_counts()
 
-    tl = delay_grid.get("top_left")
-    br = delay_grid.get("bottom_right")
-    if tl and br:
-        x1, y1 = tl
-        x2, y2 = br
-        if x2 < x1: x1, x2 = x2, x1
-        if y2 < y1: y1, y2 = y2, y1
-        width = max(1, x2 - x1)
-        height = max(1, y2 - y1)
-        best_cols = compute_best_columns(width, height, song_ticks)
-        best_rows = compute_best_rows(width, height, song_ticks)
-        if columns_override: best_cols = columns_override
-        if rows_override: best_rows = rows_override
-        cols_entry.delete(0, tk.END)
-        cols_entry.insert(0, str(best_cols))
-        rows_entry.delete(0, tk.END)
-        rows_entry.insert(0, str(best_rows))
+    # update mapping regardless of overlay visibility (this is the key: mapping exists while overlay hidden)
+    update_mapping()
+    # update overlay if it's visible
     root.after(0, update_or_create_overlay)
-
 
 # ---------------- Capture handlers ----------------
 def capture_note_position(note):
@@ -324,6 +413,8 @@ def capture_grid_corner(corner):
         delay_grid[corner] = (x, y)
         capturing_grid_corner = False
         root.after(0, lambda: btn.config(text=f"{corner.replace('_',' ').title()}: ({x},{y})"))
+        # mapping changed -> update mapping (precompute positions)
+        update_mapping()
         root.after(0, update_or_create_overlay)
     threading.Thread(target=wait_f6, daemon=True).start()
 
@@ -383,10 +474,9 @@ def _f6_global_handler(evt):
 
     root.after(0, _ui_updates)
 
-
 # ---------------- Overlay ----------------
 def create_overlay(preview=False):
-    global overlay_window, overlay_canvas, overlay_transparent_supported, last_overlay_mapping
+    global overlay_window, overlay_canvas, overlay_transparent_supported, _last_drawn_params
     tl = delay_grid.get("top_left"); br = delay_grid.get("bottom_right")
     if not tl or not br or song_ticks <= 0:
         destroy_overlay(); return
@@ -433,10 +523,14 @@ def create_overlay(preview=False):
     except Exception:
         pass
 
+    # force overlay redraw next time
+    global overlay_dirty
+    overlay_dirty = True
+    _last_drawn_params = None
     update_overlay()
 
 def destroy_overlay():
-    global overlay_window, overlay_canvas, last_overlay_mapping
+    global overlay_window, overlay_canvas, _last_drawn_params
     try:
         if overlay_window is not None:
             overlay_window.destroy()
@@ -444,79 +538,19 @@ def destroy_overlay():
         pass
     overlay_window = None
     overlay_canvas = None
-    last_overlay_mapping = None
+    _last_drawn_params = None
 
 def update_overlay():
-    global last_overlay_mapping
+    """Redraw overlay only when mapping or visual parameters changed.
+    Uses tick_positions precomputed by update_mapping() if available.
+    """
+    global _last_drawn_params, overlay_dirty
     if overlay_canvas is None:
         return
-    tl = delay_grid.get("top_left"); br = delay_grid.get("bottom_right")
-    if not tl or not br or song_ticks <= 0:
+    if last_overlay_mapping is None:
         return
 
-    tlp = delay_grid.get("top_left")
-    brp = delay_grid.get("bottom_right")
-    # jeśli któregokolwiek brakuje, przerwij (już masz warunek wcześniej, ale dodatkowe zabezpieczenie)
-    if not tlp or not brp:
-        return
-
-    # oblicz współrzędne pozostałych narożników prostokąta:
-    trp = (brp[0], tlp[1])  # top-right: x z bottom-right, y z top-left
-    blp = (tlp[0], brp[1])  # bottom-left: x z top_left, y z bottom_right
-
-
-    pts = [tlp, trp, brp, blp]
-    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-    min_x, min_y = int(min(xs)), int(min(ys))
-
-    tl_local = (tlp[0] - min_x, tlp[1] - min_y)
-    tr_local = (trp[0] - min_x, trp[1] - min_y)
-    br_local = (brp[0] - min_x, brp[1] - min_y)
-    bl_local = (blp[0] - min_x, blp[1] - min_y)
-
-    try:
-        overlay_window.update_idletasks()
-    except Exception:
-        pass
-
-    width = overlay_canvas.winfo_width()
-    height = overlay_canvas.winfo_height()
-    if width <= 1 or height <= 1:
-        root.after(50, update_overlay)
-        return
-
-    cols = columns_override if columns_override is not None else compute_best_columns(width, height, song_ticks)
-    rows = rows_override if rows_override is not None else compute_best_rows(width, height, song_ticks)
-
-    src_rect = [(0.0,0.0),(float(width),0.0),(float(width),float(height)),(0.0,float(height))]
-    dst_quad = [tl_local, tr_local, br_local, bl_local]
-    H = compute_homography(src_rect, dst_quad)
-
-    cell_w = width / max(cols,1)
-    cell_h = height / max(rows,1)
-
-    try:
-        origin_x = overlay_window.winfo_rootx()
-        origin_y = overlay_window.winfo_rooty()
-    except Exception:
-        origin_x = min_x
-        origin_y = min_y
-
-    last_overlay_mapping = {
-        'H': H,
-        'cols': cols,
-        'rows': rows,
-        'cell_w': cell_w,
-        'cell_h': cell_h,
-        'origin_x': origin_x,
-        'origin_y': origin_y,
-        'width': width,
-        'height': height,
-        'min_x': min_x,
-        'min_y': min_y
-    }
-
-    overlay_canvas.delete("all")
+    # collect current visual params to detect change
     try:
         user_dot_size = int(dot_size_var.get())
         if user_dot_size < 1:
@@ -524,7 +558,32 @@ def update_overlay():
     except Exception:
         user_dot_size = None
 
-    min_dim = min(cell_w, cell_h)
+    try:
+        skew_x = float(skew_x_var.get())
+        skew_y = float(skew_y_var.get())
+    except Exception:
+        skew_x = 0.0; skew_y = 0.0
+
+    params = (
+        last_overlay_mapping['cols'], last_overlay_mapping['rows'],
+        last_overlay_mapping['width'], last_overlay_mapping['height'],
+        user_dot_size, skew_x, skew_y, overlay_transparent_supported
+    )
+
+    # If nothing changed and overlay is not marked dirty, skip redraw
+    if not overlay_dirty and params == _last_drawn_params:
+        return
+
+    _last_drawn_params = params
+
+    width = last_overlay_mapping['width']
+    height = last_overlay_mapping['height']
+    min_x = last_overlay_mapping['min_x']
+    min_y = last_overlay_mapping['min_y']
+
+    overlay_canvas.delete("all")
+
+    min_dim = min(last_overlay_mapping['cell_w'], last_overlay_mapping['cell_h'])
     if user_dot_size is not None:
         dot_r = user_dot_size
     else:
@@ -532,51 +591,47 @@ def update_overlay():
 
     color = "red" if overlay_transparent_supported else "white"
 
-    # Get skew values
-    try:
-        skew_x = float(skew_x_var.get())
-        skew_y = float(skew_y_var.get())
-    except Exception:
-        skew_x = 0.0
-        skew_y = 0.0
+    # if we have precomputed positions, draw them relative to overlay
+    if tick_positions is not None:
+        # draw only visible ticks within overlay bounds
+        for i, (abs_x, abs_y) in enumerate(tick_positions):
+            x_local = abs_x - min_x
+            y_local = abs_y - min_y
+            if not (math.isfinite(x_local) and math.isfinite(y_local)):
+                continue
+            if x_local < -dot_r or x_local > width + dot_r or y_local < -dot_r or y_local > height + dot_r:
+                continue
+            x1 = int(round(x_local - dot_r)); y1 = int(round(y_local - dot_r))
+            x2 = int(round(x_local + dot_r)); y2 = int(round(y_local + dot_r))
+            # create simple oval; avoid extra options
+            overlay_canvas.create_oval(x1, y1, x2, y2, fill=color, outline="")
+    else:
+        # fallback: draw by computing coords on the fly (rare)
+        cols = last_overlay_mapping['cols']; rows = last_overlay_mapping['rows']
+        cell_w = last_overlay_mapping['cell_w']; cell_h = last_overlay_mapping['cell_h']
+        H = last_overlay_mapping['H']
+        origin_x = last_overlay_mapping['origin_x']; origin_y = last_overlay_mapping['origin_y']
+        for i in range(song_ticks):
+            col = i % cols
+            row = i // cols
+            sx = (col + 0.5) * cell_w
+            sy = (row + 0.5) * cell_h
+            x_local, y_local = apply_homography(H, sx, sy)
+            # pixel-based skew
+            center_x = width / 2.0; center_y = height / 2.0
+            dx = (x_local - center_x) / center_x if center_x != 0 else 0.0
+            dy = (y_local - center_y) / center_y if center_y != 0 else 0.0
+            try:
+                skew_x = float(skew_x_var.get()); skew_y = float(skew_y_var.get())
+            except Exception:
+                skew_x = 0.0; skew_y = 0.0
+            x_local = x_local + dx * skew_x * center_x
+            y_local = y_local + dy * skew_y * center_y
+            x1 = int(round(x_local - dot_r)); y1 = int(round(y_local - dot_r))
+            x2 = int(round(x_local + dot_r)); y2 = int(round(y_local + dot_r))
+            overlay_canvas.create_oval(x1, y1, x2, y2, fill=color, outline="")
 
-    # Calculate center of the grid
-    center_x = width / 2.0
-    center_y = height / 2.0
-
-    for i in range(song_ticks):
-        col = i % cols
-        row = i // cols
-        sx = (col + 0.5) * cell_w
-        sy = (row + 0.5) * cell_h
-        x_local, y_local = apply_homography(H, sx, sy)
-
-        # FIXED SKEW IMPLEMENTATION (matching the old working code)
-        # Calculate normalized distance from center (-1 to 1)
-        # PIXEL-BASED SKEW (same as overlay)
-        center_x = width / 2.0
-        center_y = height / 2.0
-        if center_x != 0:
-              dx = (x_local - center_x) / center_x
-        else:
-              dx = 0.0
-        if center_y != 0:
-              dy = (y_local - center_y) / center_y
-        else:
-              dy = 0.0
-
-        x_local = x_local + dx * skew_x * center_x
-        y_local = y_local + dy * skew_y * center_y
-
-
-        if not (math.isfinite(x_local) and math.isfinite(y_local)):
-            continue
-        if x_local < -dot_r or x_local > width + dot_r or y_local < -dot_r or y_local > height + dot_r:
-            continue
-
-        x1 = int(round(x_local - dot_r)); y1 = int(round(y_local - dot_r))
-        x2 = int(round(x_local + dot_r)); y2 = int(round(y_local + dot_r))
-        overlay_canvas.create_oval(x1, y1, x2, y2, fill=color, outline="")
+    overlay_dirty = False
 
 # update overlay periodically if shown
 def update_or_create_overlay():
@@ -600,6 +655,8 @@ def set_columns_from_entry():
             columns_override = c
         except Exception:
             columns_override = None
+    # mapping changed
+    update_mapping()
     update_or_create_overlay()
 
 def set_rows_from_entry():
@@ -615,6 +672,7 @@ def set_rows_from_entry():
             rows_override = r
         except Exception:
             rows_override = None
+    update_mapping()
     update_or_create_overlay()
 
 def apply_grid_settings():
@@ -666,18 +724,11 @@ def _send_input_mouse(ax, ay, flags):
     inp.mi.dwExtraInfo = None
     SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
+# keep move_smooth_to but use a fixed short duration (not used by teleport+wiggle flow)
 def move_smooth_to(x_target, y_target):
-    """Smooth interpolation to target using easing. Total duration taken from move_duration_var (ms).
-    Uses many small SendInput moves to create visually smooth motion (not coarse steps).
+    """Smooth interpolation to target using easing. Uses a short fixed duration.
     """
-    try:
-        total_ms = float(move_duration_var.get())
-    except Exception:
-        try:
-            total_ms = float(step_delay_var.get()) * max(1, move_step_var.get()/6)
-        except Exception:
-            total_ms = 60.0
-    total_s = max(0.008, total_ms / 1000.0)
+    total_s = 0.06
 
     x0, y0 = get_cursor_pos()
     dx = x_target - x0; dy = y_target - y0
@@ -687,42 +738,99 @@ def move_smooth_to(x_target, y_target):
         _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
         return
 
-    # choose many small steps (approx 3 steps per pixel) for smoothness
     steps = max(int(dist * 3), 12)
     per_step = total_s / steps
     for i in range(1, steps + 1):
         t = i / steps
-        # smoothstep easing (ease in/out)
         t_s = t * t * (3 - 2 * t)
         xi = x0 + dx * t_s
         yi = y0 + dy * t_s
         ax, ay = to_absolute_coords(xi, yi)
         _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
         time.sleep(per_step)
-    # final precise position
     ax, ay = to_absolute_coords(x_target, y_target)
     _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
 
 
+# Modified: teleport + circular wiggle before click
 
 def move_and_click_abs(x, y, pause_before_click=0.006):
+    """Teleport instantly to (x,y), perform a small circular wiggle around it, then click.
+    Wiggle amplitude and count are configurable via wiggle_amp_var and wiggle_count_var.
+    """
     try:
-        move_smooth_to(x, y)
+        # immediate teleport to exact position (absolute coords)
+        ax, ay = to_absolute_coords(x, y)
+        _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
+        # tiny pause to let the OS update cursor
+        time.sleep(0.002)
+
+        # get user-configured wiggle params
+        try:
+            amp = float(wiggle_amp_var.get())
+            cnt = int(wiggle_count_var.get())
+            if amp < 0: amp = 0.0
+            if cnt < 0: cnt = 0
+        except Exception:
+            amp = 2.0; cnt = 3
+
+        # do circular wiggle: evenly spaced angles around the circle
+        if cnt > 0 and amp > 0.0:
+            for i in range(cnt):
+                angle = 2.0 * math.pi * (i / cnt)
+                # add a tiny random jitter to radius and angle so it's not perfectly mechanical
+                r = amp * (0.7 + 0.3 * random.random())
+                a = angle + random.uniform(-0.15, 0.15)
+                ox = x + math.cos(a) * r
+                oy = y + math.sin(a) * r
+                ax, ay = to_absolute_coords(ox, oy)
+                _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
+                time.sleep(0.007)
+
+        # final precise position before click
+        ax, ay = to_absolute_coords(x, y)
+        _send_input_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
         time.sleep(pause_before_click)
+
+        # click (left down/up)
         _send_input_mouse(0, 0, MOUSEEVENTF_LEFTDOWN)
         time.sleep(0.010)
         _send_input_mouse(0, 0, MOUSEEVENTF_LEFTUP)
         time.sleep(0.004)
     except Exception:
+        # fallback in case SendInput fails for any reason
         try:
+            ctypes.windll.user32.SetCursorPos(int(round(x)), int(round(y)))
+            # small circular wiggle fallback using SetCursorPos
+            try:
+                amp = float(wiggle_amp_var.get())
+                cnt = int(wiggle_count_var.get())
+            except Exception:
+                amp = 2.0; cnt = 3
+            if cnt > 0 and amp > 0.0:
+                for i in range(cnt):
+                    angle = 2.0 * math.pi * (i / cnt)
+                    r = amp * (0.7 + 0.3 * random.random())
+                    a = angle + random.uniform(-0.15, 0.15)
+                    ox = int(round(x + math.cos(a) * r))
+                    oy = int(round(y + math.sin(a) * r))
+                    ctypes.windll.user32.SetCursorPos(ox, oy)
+                    time.sleep(0.007)
             ctypes.windll.user32.SetCursorPos(int(round(x)), int(round(y)))
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
             ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         except Exception:
             pass
 
+
 def compute_screen_coords_for_tick(tick_index):
-    global last_overlay_mapping
+    global last_overlay_mapping, tick_positions
+    # If we precomputed tick_positions, just return it
+    if tick_positions is not None:
+        if 0 <= tick_index < len(tick_positions):
+            return tick_positions[tick_index]
+        return None
+
     # If we don't have an overlay mapping, fall back to a simple grid math
     if last_overlay_mapping is None:
         tl = delay_grid.get("top_left"); br = delay_grid.get("bottom_right")
@@ -790,11 +898,6 @@ def compute_screen_coords_for_tick(tick_index):
 
 
 # ---------------- Play logic ----------------
-def _stop_listener():
-    global stop_play
-    keyboard.wait("f7")
-    stop_play = True
-
 def play_song_thread():
     global song_ticks, notes_by_tick, note_positions, tempo, stop_play
     if song_ticks <= 0:
@@ -803,7 +906,6 @@ def play_song_thread():
     compute_required_counts()
 
     stop_play = False
-    threading.Thread(target=_stop_listener, daemon=True).start()
     countdown = 5.0
     start_time = time.time()
     while time.time() - start_time < countdown:
@@ -814,7 +916,8 @@ def play_song_thread():
     prev_tick = 0
     for tick in range(song_ticks):
         if stop_play:
-            output_text.insert(tk.END, "Playback stopped by user.\n"); break
+            output_text.insert(tk.END, "Playback stopped by user.\n")
+            break
 
         notes_in_tick = notes_by_tick.get(tick, [])
         delay_sec = (tick - prev_tick) / tempo if tempo > 0 else 0.0
@@ -849,13 +952,26 @@ def play_song_thread():
                     x, y = positions[idx]
                     used_indices[name] = idx + 1
                     move_and_click_abs(x, y)
-                    time.sleep(0.004)
+                    # wait between individual note clicks according to user setting
+                    try:
+                        wait_ms = float(move_between_notes_var.get())
+                    except Exception:
+                        wait_ms = 6.0
+                    time.sleep(max(0.0, wait_ms) / 1000.0)
                 else:
                     output_text.insert(tk.END, f"Missing capture for {name} instance; skipping that note's click.\n")
 
             tick_pos = compute_screen_coords_for_tick(tick)
             if tick_pos:
+                # if we had notes this tick, wait move_to_delay_ms before moving to delay cell
+                if notes_in_tick:
+                    try:
+                        wait_ms = float(move_to_delay_var.get())
+                    except Exception:
+                        wait_ms = 20.0
+                    time.sleep(max(0.0, wait_ms) / 1000.0)
                 move_and_click_abs(tick_pos[0], tick_pos[1])
+                # after clicking the delay cell, small pause
                 time.sleep(0.004)
             else:
                 output_text.insert(tk.END, f"No tick cell mapping for tick {tick}; delay cell click skipped.\n")
@@ -876,9 +992,9 @@ def play_song():
 
 # ---------------- GUI construction (compact) ----------------
 root = tk.Tk()
-root.title("NBS Overlay Clicker - Fixed Skew")
+root.title("NBS Overlay Music maker")
 # smaller default window
-root.geometry("900x520")
+root.geometry("700x520")
 
 # Output area (smaller)
 output_text = scrolledtext.ScrolledText(root, width=100, height=12)
@@ -932,6 +1048,16 @@ load_btn.pack(side="left", padx=4)
 show_grid_btn = tk.Button(controls, text="Show Grid", width=10, command=toggle_overlay)
 show_grid_btn.pack(side="left", padx=4)
 
+# Reset Notes button (new)
+def reset_note_captures():
+    global note_positions
+    note_positions = {note: [] for note in NOTE_NAMES}
+    compute_required_counts()
+    output_text.insert(tk.END, "All note captures reset.\n")
+
+reset_notes_btn = tk.Button(controls, text="Reset Notes", width=10, command=reset_note_captures)
+reset_notes_btn.pack(side="left", padx=4)
+
 # grid settings compact
 cols_entry = tk.Entry(controls, width=4)
 rows_entry = tk.Entry(controls, width=4)
@@ -948,11 +1074,11 @@ apply_grid_btn = tk.Button(controls, text="Apply Grid", width=10, command=apply_
 apply_grid_btn.pack(side="left", padx=6)
 
 # dot size + movement controls (compact)
-
 dot_size_var = tk.IntVar(value=2)
-move_step_var = tk.IntVar(value=6)
-step_delay_var = tk.DoubleVar(value=20.0)  # default 20 ms per step
-move_duration_var = tk.DoubleVar(value=60.0)  # Initialize the missing variable
+
+# NEW: timing settings (ms)
+move_between_notes_var = tk.DoubleVar(value=5.0)   # ms between note clicks
+move_to_delay_var = tk.DoubleVar(value=400.0)      # ms before moving to delay cell
 
 # place smaller control widgets
 ctrl2 = tk.Frame(root)
@@ -962,44 +1088,30 @@ tk.Label(ctrl2, text="Dot:").pack(side="left")
 dot_size_spin = tk.Spinbox(ctrl2, from_=1, to=8, width=3, textvariable=dot_size_var)
 dot_size_spin.pack(side="left", padx=4)
 
-tk.Label(ctrl2, text="Move duration(ms):").pack(side="left", padx=(8,0))
-move_duration_spin = tk.Spinbox(ctrl2, from_=10.0, to=200.0, increment=10.0, width=6, textvariable=move_duration_var)
-move_duration_spin.pack(side="left", padx=4)
+# timing controls
+tk.Label(ctrl2, text="Between notes (ms):").pack(side="left", padx=(8,0))
+move_between_spin = tk.Spinbox(ctrl2, from_=0.0, to=1000.0, increment=1.0, width=6, textvariable=move_between_notes_var)
+move_between_spin.pack(side="left", padx=4)
 
-tk.Label(ctrl2, text="Move step:").pack(side="left", padx=(8,0))
-move_step_spin = tk.Spinbox(ctrl2, from_=1, to=50, width=4, textvariable=move_step_var)
-move_step_spin.pack(side="left", padx=4)
+tk.Label(ctrl2, text="To delay (ms):").pack(side="left", padx=(8,0))
+move_to_delay_spin = tk.Spinbox(ctrl2, from_=0.0, to=2000.0, increment=1.0, width=6, textvariable=move_to_delay_var)
+move_to_delay_spin.pack(side="left", padx=4)
 
-tk.Label(ctrl2, text="Step delay(ms):").pack(side="left", padx=(8,0))
-step_delay_spin = tk.Spinbox(ctrl2, from_=0.1, to=50.0, increment=0.1, width=6, textvariable=step_delay_var)
-step_delay_spin.pack(side="left", padx=4)
+# Wiggle controls (new)
+wiggle_amp_var = tk.DoubleVar(value=2.4)  # pixels
+wiggle_count_var = tk.IntVar(value=12)
+
+tk.Label(ctrl2, text="Wiggle px:").pack(side="left", padx=(8,0))
+wiggle_amp_spin = tk.Spinbox(ctrl2, from_=0.0, to=20.0, increment=0.5, width=5, textvariable=wiggle_amp_var)
+wiggle_amp_spin.pack(side="left", padx=4)
+
+tk.Label(ctrl2, text="Wiggle cnt:").pack(side="left", padx=(6,0))
+wiggle_count_spin = tk.Spinbox(ctrl2, from_=0, to=20, width=3, textvariable=wiggle_count_var)
+wiggle_count_spin.pack(side="left", padx=4)
 
 # Skew controls (small)
 skew_frame = tk.Frame(root)
 skew_frame.pack(fill="x", padx=6, pady=(6,4))
-
-# Always on top flag for main window and overlay
-always_on_top_var = tk.BooleanVar(value=False)
-
-def set_always_on_top():
-    val = bool(always_on_top_var.get())
-    # main window
-    try:
-        root.attributes("-topmost", val)
-    except Exception:
-        pass
-    # overlay window (jeśli istnieje)
-    try:
-        if overlay_window is not None:
-            overlay_window.attributes("-topmost", val)
-    except Exception:
-        pass
-
-# dodaj to np. w ctrl2 obok innych kontrolek
-always_chk = tk.Checkbutton(ctrl2, text="Always on top", variable=always_on_top_var,
-                            onvalue=True, offvalue=False, command=set_always_on_top)
-always_chk.pack(side="left", padx=(8,4))
-
 
 # Use DoubleVar to hold numeric values; entries display formatted 0.00 and buttons adjust by 0.01
 skew_x_var = tk.DoubleVar(value=0.0)
@@ -1010,13 +1122,6 @@ skew_x_entry = tk.Entry(skew_frame, width=8)
 skew_x_entry.pack(side="left", padx=6)
 skew_x_entry.insert(0, "0.00")
 
-# zamiast stałego True ustaw wartość z checkboxa
-try:
-    overlay_window.attributes("-topmost", bool(always_on_top_var.get()))
-except Exception:
-    pass
-
-
 def apply_skew_x(e=None):
     try:
         v = float(skew_x_entry.get())
@@ -1025,6 +1130,8 @@ def apply_skew_x(e=None):
     skew_x_var.set(v)
     skew_x_entry.delete(0, tk.END)
     skew_x_entry.insert(0, f"{v:.2f}")
+    # mapping changed
+    update_mapping()
     update_or_create_overlay()
 
 skew_x_entry.bind("<Return>", apply_skew_x)
@@ -1034,13 +1141,13 @@ def _inc_skew_x():
     v = round(skew_x_var.get() + 0.01, 2)
     skew_x_var.set(v)
     skew_x_entry.delete(0, tk.END); skew_x_entry.insert(0, f"{v:.2f}")
-    update_or_create_overlay()
+    update_mapping(); update_or_create_overlay()
 
 def _dec_skew_x():
     v = round(skew_x_var.get() - 0.01, 2)
     skew_x_var.set(v)
     skew_x_entry.delete(0, tk.END); skew_x_entry.insert(0, f"{v:.2f}")
-    update_or_create_overlay()
+    update_mapping(); update_or_create_overlay()
 
 tk.Button(skew_frame, text="+0.01", width=5, command=_inc_skew_x).pack(side="left", padx=2)
 tk.Button(skew_frame, text="-0.01", width=5, command=_dec_skew_x).pack(side="left", padx=2)
@@ -1058,7 +1165,7 @@ def apply_skew_y(e=None):
     skew_y_var.set(v)
     skew_y_entry.delete(0, tk.END)
     skew_y_entry.insert(0, f"{v:.2f}")
-    update_or_create_overlay()
+    update_mapping(); update_or_create_overlay()
 
 skew_y_entry.bind("<Return>", apply_skew_y)
 
@@ -1067,18 +1174,18 @@ def _inc_skew_y():
     v = round(skew_y_var.get() + 0.01, 2)
     skew_y_var.set(v)
     skew_y_entry.delete(0, tk.END); skew_y_entry.insert(0, f"{v:.2f}")
-    update_or_create_overlay()
+    update_mapping(); update_or_create_overlay()
 
 def _dec_skew_y():
     v = round(skew_y_var.get() - 0.01, 2)
     skew_y_var.set(v)
     skew_y_entry.delete(0, tk.END); skew_y_entry.insert(0, f"{v:.2f}")
-    update_or_create_overlay()
+    update_mapping(); update_or_create_overlay()
 
 tk.Button(skew_frame, text="+0.01", width=5, command=_inc_skew_y).pack(side="left", padx=2)
 tk.Button(skew_frame, text="-0.01", width=5, command=_dec_skew_y).pack(side="left", padx=2)
 
-reset_skew_btn = tk.Button(skew_frame, text="Reset Skew", command=lambda: (skew_x_var.set(0.0), skew_y_var.set(0.0), skew_x_entry.delete(0, tk.END), skew_x_entry.insert(0, "0.00"), skew_y_entry.delete(0, tk.END), skew_y_entry.insert(0, "0.00"), update_or_create_overlay()))
+reset_skew_btn = tk.Button(skew_frame, text="Reset Skew", command=lambda: (skew_x_var.set(0.0), skew_y_var.set(0.0), skew_x_entry.delete(0, tk.END), skew_x_entry.insert(0, "0.00"), skew_y_entry.delete(0, tk.END), skew_y_entry.insert(0, "0.00"), update_mapping(), update_or_create_overlay()))
 reset_skew_btn.pack(side="left", padx=6)
 
 overlay_status_var = tk.StringVar(value="Overlay: hidden")
@@ -1088,30 +1195,64 @@ status_label.pack(side="left", padx=6)
 play_button = tk.Button(root, text="Play Song", width=12, command=play_song)
 play_button.pack(side="right", padx=8, pady=6)
 
-# This section should be placed at the END of your script, 
-# right before root.mainloop()
+# Always on top flag for main window and overlay
+always_on_top_var = tk.BooleanVar(value=False)
+
+def set_always_on_top():
+    val = bool(always_on_top_var.get())
+    try:
+        root.attributes("-topmost", val)
+    except Exception:
+        pass
+    try:
+        if overlay_window is not None:
+            overlay_window.attributes("-topmost", val)
+    except Exception:
+        pass
+
+# CHECKBOX OBOK SKEW
+always_chk = tk.Checkbutton(
+    skew_frame,
+    text="Always on top",
+    variable=always_on_top_var,
+    onvalue=True,
+    offvalue=False,
+    command=set_always_on_top
+)
+always_chk.pack(side="left", padx=(8,4))
+
+# bezpieczne ustawienie przy starcie
+try:
+    if overlay_window is not None:
+        overlay_window.attributes("-topmost", bool(always_on_top_var.get()))
+except Exception:
+    pass
 
 # ---------------- Register keyboard handlers ----------------
 # Register F6 handler for capturing note positions
 keyboard.on_press_key("f6", _f6_global_handler)
 
-# Register F7 handler for stopping playback
-def on_f7_press(e=None):
+# Register F7 handler for stopping playback (fixed)
+def _on_f7(e=None):
     global stop_play
     stop_play = True
+    try:
+        root.after(0, lambda: output_text.insert(tk.END, "F7 pressed — stopping playback.\n"))
+    except Exception:
+        pass
 
-keyboard.on_press_key("f7", lambda e: on_f7_press())
+keyboard.on_press_key("f7", _on_f7)
 
 # ---------------- Start periodic refresh and mainloop ----------------
 def periodic_refresh():
-    # update overlay if enabled
-    if overlay_shown and overlay_window is not None:
-        try:
+    # update overlay if enabled (but only redraw when needed)
+    try:
+        if overlay_shown and overlay_window is not None:
             update_overlay()
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-    # update note button labels (armed / counts)
+    # update note button labels (armed / counts) - lightweight
     try:
         with armed_lock:
             armed = armed_note
