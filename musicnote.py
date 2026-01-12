@@ -8,7 +8,7 @@
 
 import pynbs
 import tkinter as tk
-from tkinter import filedialog, scrolledtext
+from tkinter import filedialog, scrolledtext, messagebox
 import ctypes
 from ctypes import wintypes
 import threading
@@ -76,6 +76,10 @@ columns_override = None
 rows_override = None
 notes_by_tick = {}
 tempo = 0.0
+# Collect special notes that look like tempo changers (e.g. instrument 16)
+tempo_changer_notes = []
+# Function that returns effective ticks-per-second at a given tick (after applying tempo changers)
+tps_at_tick = None
 stop_play = False
 last_overlay_mapping = None
 # Precomputed tick absolute positions (len = song_ticks) or None
@@ -97,10 +101,26 @@ def key_to_note_name(key):
     return f"Unknown({key})"
 
 def instrument_to_name(inst):
-    return {0:"Piano",1:"Bass Drum",2:"Snare Drum",3:"Click",
-            4:"Guitar",5:"Flute",6:"Bell",7:"Chime",
-            8:"Xylophone",9:"Iron Xylophone",10:"Cow Bell",
-            11:"Didgeridoo",12:"Bit",13:"Banjo",14:"Pling"}.get(inst, f"Unknown({inst})")
+    mapping = {
+        0: "Piano",
+        1: "Bass Drum",
+        2: "Snare Drum",
+        3: "Click",
+        4: "Guitar",
+        5: "Flute",
+        6: "Bell",
+        7: "Chime",
+        8: "Xylophone",
+        9: "Iron Xylophone",
+        10: "Cow Bell",
+        11: "Didgeridoo",
+        12: "Bit",
+        13: "Banjo",
+        14: "Pling",
+        # Treat custom instrument 16 as a Tempo Changer marker so we can detect it
+        16: "TempoChanger",
+    }
+    return mapping.get(inst, f"Unknown({inst})")
 
 
 def quantize_delay_to_step(value, step=0.01, minimum=0.05):
@@ -243,6 +263,76 @@ def compute_required_counts():
     except Exception:
         pass
 
+
+def build_tps_at_tick(header_tps, tempo_changer_notes_list):
+    """Build a function that returns effective ticks-per-second at a given tick.
+
+    We interpret TempoChanger notes (instrument 16) as encoding a BPM-like value in
+    their ``pitch`` field. We then scale the header tempo proportionally based on
+    the ratio between the current tempo-changer pitch and the first one.
+
+    This is heuristic but keeps relative speed-ups / slow-downs in sync with NBS.
+    """
+    try:
+        base_tps = float(header_tps)
+    except Exception:
+        base_tps = 0.0
+    if base_tps <= 0 or not tempo_changer_notes_list:
+        # No tempo info or no changers: constant tempo.
+        return lambda tick: base_tps
+
+    # Collect (tick, pitch) where pitch > 0
+    events = []
+    for n in tempo_changer_notes_list:
+        try:
+            p = float(getattr(n, "pitch", 0))
+        except Exception:
+            continue
+        if p <= 0:
+            continue
+        try:
+            t = int(getattr(n, "tick", 0))
+        except Exception:
+            t = 0
+        events.append((t, p))
+
+    if not events:
+        return lambda tick: base_tps
+
+    # Sort by tick and keep the last event per tick.
+    events.sort(key=lambda e: e[0])
+    compressed = []
+    last_tick = None
+    for t, p in events:
+        if t == last_tick and compressed:
+            compressed[-1] = (t, p)
+        else:
+            compressed.append((t, p))
+            last_tick = t
+    events = compressed
+
+    base_tick, base_pitch = events[0]
+    if base_pitch <= 0:
+        return lambda tick: base_tps
+
+    def _tps_at_tick(tick):
+        """Return effective ticks-per-second at the given tick."""
+        current_pitch = base_pitch
+        for ev_tick, ev_pitch in events:
+            if ev_tick > tick:
+                break
+            current_pitch = ev_pitch
+        # Scale header tempo proportionally by BPM-like ratio.
+        try:
+            if current_pitch <= 0:
+                return base_tps
+            return base_tps * (current_pitch / base_pitch)
+        except Exception:
+            return base_tps
+
+    return _tps_at_tick
+
+
 # ---------------- Mapping / caching (NEW) ----------------
 def update_mapping():
     """Compute and cache the overlay homography, grid metrics and absolute tick positions.
@@ -345,7 +435,7 @@ def update_mapping():
 
 # ---------------- NBS loader ----------------
 def load_nbs():
-    global song_ticks, notes_by_tick, tempo, active_ticks, active_tick_index
+    global song_ticks, notes_by_tick, tempo, active_ticks, active_tick_index, tempo_changer_notes, tps_at_tick
     file_path = filedialog.askopenfilename(filetypes=[("NBS files", "*.nbs")])
     if not file_path:
         return
@@ -360,8 +450,17 @@ def load_nbs():
         header_length = 0
 
     notes_by_tick.clear()
+    tempo_changer_notes = []
     max_tick = 0
     for n in song.notes:
+        # Heuristic: treat custom instrument 16 on any layer as a tempo changer marker.
+        # We don't yet know how to decode its value, so we just record full note data.
+        if getattr(n, "instrument", None) == 16:
+            tempo_changer_notes.append(n)
+            if n.tick > max_tick:
+                max_tick = n.tick
+            continue
+
         if NOTE_MIN <= n.key <= NOTE_MAX:
             notes_by_tick.setdefault(n.tick, []).append(n)
             if n.tick > max_tick:
@@ -369,6 +468,9 @@ def load_nbs():
 
     # ✅ Fix: some NBS files set header_length wrong, so include last tick
     song_ticks = max(header_length, max_tick + 1)
+
+    # Build tempo map (ticks-per-second as a function of tick)
+    tps_at_tick = build_tps_at_tick(tempo, tempo_changer_notes)
 
     # Build compressed tick mapping: only ticks that actually contain notes
     active_ticks = [t for t in range(song_ticks) if notes_by_tick.get(t)]
@@ -379,12 +481,42 @@ def load_nbs():
     output_text.insert(tk.END, f"Header ticks: {header_length}, derived ticks: {song_ticks}\n")
     # Inform user how many delay blocks they actually need after compression
     output_text.insert(tk.END, f"Compressed non-empty ticks: {len(active_ticks)} (you need this many delay blocks)\n")
-    output_text.insert(tk.END, "Tick | Delay(s) | Notes (Layer, Instrument, NoteName)\\n")
 
-    prev_tick = 0
-    for tick in range(song_ticks):
+    output_text.insert(tk.END, "Tick | Delay(s since prev note) | Notes (Layer, Instrument, NoteName)\n")
+
+    # For logging, show the same per-note delay that the tempo tool uses *now*:
+    # all empty ticks between the PREVIOUS note and THIS note are added to this note.
+    # (Initial silence from tick 0 up to the first note is added to the first note.)
+    # The user wants to see all ticks here, so don't limit.
+    max_debug_ticks = song_ticks
+    for tick in range(max_debug_ticks):
         notes_in_tick = notes_by_tick.get(tick, [])
-        delay_sec = (tick - prev_tick) / tempo if tempo > 0 else 0.0
+
+        # Default: empties show 0.0 delay in the table.
+        delay_sec = 0.0
+        if notes_in_tick:
+            idx = active_tick_index.get(tick)
+            if idx is not None:
+                # Backward gap: from previous active tick (or 0) up to THIS tick.
+                if idx == 0:
+                    prev_tick_for_gap = 0
+                else:
+                    prev_tick_for_gap = active_ticks[idx - 1]
+
+                gap_ticks = max(1, tick - prev_tick_for_gap)
+                tempo_tick = prev_tick_for_gap
+
+                effective_tps = None
+                try:
+                    if callable(tps_at_tick):
+                        effective_tps = float(tps_at_tick(tempo_tick))
+                except Exception:
+                    effective_tps = None
+                if effective_tps is None or effective_tps <= 0:
+                    effective_tps = tempo
+
+                delay_sec = gap_ticks / effective_tps if effective_tps > 0 else 0.0
+
         if notes_in_tick:
             notes_str = ", ".join([
                 f"(L{n.layer}, {instrument_to_name(n.instrument)}, {key_to_note_name(n.key)})"
@@ -393,7 +525,6 @@ def load_nbs():
         else:
             notes_str = "<no notes>"
         output_text.insert(tk.END, f"{tick:3d} | {delay_sec:7.4f} | {notes_str}\n")
-        prev_tick = tick
 
     compute_required_counts()
 
@@ -401,6 +532,7 @@ def load_nbs():
     update_mapping()
     # update overlay if it's visible
     root.after(0, update_or_create_overlay)
+
 
 # ---------------- Capture handlers ----------------
 def capture_note_position(note):
@@ -966,11 +1098,14 @@ def compute_screen_coords_for_tick(tick_index):
 def apply_tempo_to_delays():
     """Use the in-game tempo tool (slot 6) to set delay times on all delay blocks.
 
-    For each non-empty tick (active tick), we compute the total time since the
-    previous active tick, quantize it to game resolution (0.01, min 0.05),
-    group equal values and apply them using the captured tempo_tool_pos.
+    NEW SEMANTICS: for each non-empty tick (active tick), we compute the total
+    time from the *previous* active tick (or tick 0 for the first note) up to
+    THIS tick, including all empty ticks in between. That time is assigned to
+    the delay block at THIS tick ("add to the right"). We then quantize to the
+    game resolution (0.01, min 0.05), group equal values and apply them using
+    the captured tempo_tool_pos.
     """
-    global tempo, active_ticks, tick_positions, tempo_tool_pos, stop_play
+    global tempo, active_ticks, tick_positions, tempo_tool_pos, stop_play, tps_at_tick
 
     if tempo <= 0:
         output_text.insert(tk.END, "Tempo <= 0: cannot compute delays for tempo tool.\\n")
@@ -996,24 +1131,42 @@ def apply_tempo_to_delays():
     except Exception:
         pass
 
-    # Compute continuous delay (seconds) between each active tick and the previous one.
-    # First active tick should still get at least one "tick" of delay so the
-    # first delay block is not treated as 0.
-    delays = []  # same length as active_ticks
+    # Compute continuous delay (seconds) for each *active* tick, where the delay on
+    # a non-empty tick includes the time from the PREVIOUS active tick (or tick 0
+    # for the first note) up to THIS tick. In other words, all empty spaces are
+    # "pushed" onto the delay block to their RIGHT.
+    delays = []  # one delay per active tick
     if not active_ticks:
         return
 
     for idx, tick in enumerate(active_ticks):
+        # Backward gap: how many ticks from the previous active tick (or 0) up
+        # to THIS active tick. All empty ticks in that interval are accumulated
+        # onto the delay block corresponding to THIS tick.
         if idx == 0:
-            # First active tick: at least 1 tick worth of delay
-            gap_ticks = max(1, tick - 0)
+            prev_tick_for_gap = 0
         else:
-            prev_tick = active_ticks[idx - 1]
-            gap_ticks = max(1, tick - prev_tick)
-        delay_sec = gap_ticks / tempo
+            prev_tick_for_gap = active_ticks[idx - 1]
+
+        gap_ticks = max(1, tick - prev_tick_for_gap)
+        # Use tempo at the LEFT edge of the interval (prev_tick_for_gap).
+        tempo_tick = prev_tick_for_gap
+
+        effective_tps = None
+        try:
+            if callable(tps_at_tick):
+                effective_tps = float(tps_at_tick(tempo_tick))
+        except Exception:
+            effective_tps = None
+        if effective_tps is None or effective_tps <= 0:
+            effective_tps = tempo
+
+        delay_sec = gap_ticks / effective_tps if effective_tps > 0 else 0.0
         delays.append(delay_sec)
 
-    # Quantize each delay to game resolution and group by value
+    # Quantize each forward gap *after* summing all empty ticks that belong to
+    # that note. We do NOT carry rounding error between different notes; each
+    # note's delay is rounded independently up/down according to round_mode_var.
     groups = {}
     for idx, d in enumerate(delays):
         q = quantize_delay_to_step(d)
@@ -1027,7 +1180,11 @@ def apply_tempo_to_delays():
 
     output_text.insert(tk.END, f"Tempo tool: {len(groups)} delay groups to apply.\\n")
 
-    for delay_value, indices in sorted(groups.items()):
+    sorted_groups = sorted(groups.items())
+    num_groups = len(sorted_groups)
+
+    for g_idx, (delay_value, indices) in enumerate(sorted_groups):
+        is_last_group = (g_idx == num_groups - 1)
         if stop_play:
             output_text.insert(tk.END, "Tempo tool aborted by user.\\n")
             return
@@ -1089,28 +1246,42 @@ def apply_tempo_to_delays():
 
         # Focus tempo UI, paste value, press Enter
         x_ui, y_ui = tempo_tool_pos
-        # Give the UI a bit more time per group as well
-        time.sleep(0.5)
+        # Give the UI a bit more time per group as well, and after focusing the field
+        base_pre_focus = 1.0
+        pre_focus_wait = base_pre_focus * (1.8 if is_last_group else 1.0)
+        time.sleep(pre_focus_wait)
         move_and_click_abs(x_ui, y_ui, pause_before_click=0.005)
+        # Extra wait so the caret/focus is reliably inside the input box
+        post_click_wait = 0.25 * (1.8 if is_last_group else 1.0)
+        time.sleep(post_click_wait)
+
+        # Be extra safe: select-all and clear the field before pasting.
+        try:
+            keyboard.press_and_release('ctrl+a')
+            time.sleep(0.20 * (1.5 if is_last_group else 1.0))
+            keyboard.press_and_release('backspace')
+            time.sleep(0.15 * (1.5 if is_last_group else 1.0))
+        except Exception:
+            pass
 
         value_str = f"{delay_value:.2f}"
         try:
-            root.clipboard_clear()
-            root.clipboard_append(value_str)
-        except Exception:
-            pass
-        try:
-            keyboard.press_and_release('ctrl+v')
-            time.sleep(0.03)
+            # Type the value directly into the tempo field instead of using clipboard paste.
+            # This is more reliable, especially for the last group.
+            keyboard.write(value_str, delay=0.02)
+            paste_wait = 0.30 * (1.8 if is_last_group else 1.0)
+            time.sleep(paste_wait)
             keyboard.press_and_release('enter')
         except Exception:
             pass
 
-        # Small pause, then press 6 twice to save and deselect
-        time.sleep(0.05)
+        # Pause after Enter so the game can apply the new delay before closing the UI
+        after_enter_wait = 0.40 * (2.0 if is_last_group else 1.0)
+        time.sleep(after_enter_wait)
         try:
             keyboard.press_and_release('6')
-            time.sleep(0.03)
+            between_6_wait = 0.12 * (2.0 if is_last_group else 1.0)
+            time.sleep(between_6_wait)
             keyboard.press_and_release('6')
         except Exception:
             pass
@@ -1143,13 +1314,23 @@ def play_song_thread():
     # Iterate only over active (non-empty) ticks. We still keep correct timing
     # by using the tick difference (tick - prev_tick) / tempo.
     last_index = len(active_ticks) - 1
+    stopped_by_user = False
     for idx, tick in enumerate(active_ticks):
         if stop_play:
-            output_text.insert(tk.END, "Playback stopped by user.\\n")
+            stopped_by_user = True
             break
 
         notes_in_tick = notes_by_tick.get(tick, [])  # should always be non-empty here
-        delay_sec = (tick - prev_tick) / tempo if tempo > 0 else 0.0
+        # Use tempo map if available; fall back to header tempo.
+        effective_tps = None
+        try:
+            if callable(tps_at_tick):
+                effective_tps = float(tps_at_tick(prev_tick))
+        except Exception:
+            effective_tps = None
+        if effective_tps is None or effective_tps <= 0:
+            effective_tps = tempo
+        delay_sec = (tick - prev_tick) / effective_tps if effective_tps > 0 else 0.0
 
         if notes_in_tick:
             needed_by_name = {}
@@ -1192,16 +1373,14 @@ def play_song_thread():
 
             tick_pos = compute_screen_coords_for_tick(tick)
             if tick_pos:
-                # if we had notes this tick, wait move_to_delay_ms before moving to delay cell
-                if notes_in_tick:
-                    try:
-                        wait_ms = float(move_to_delay_var.get())
-                    except Exception:
-                        wait_ms = 20.0
-                    time.sleep(max(0.0, wait_ms) / 1000.0)
+                # Click the delay cell for this note
                 move_and_click_abs(tick_pos[0], tick_pos[1])
-                # after clicking the delay cell, small pause
-                time.sleep(0.004)
+                # After clicking the delay cell, wait according to the configured delay (ms)
+                try:
+                    wait_ms = float(move_to_delay_var.get())
+                except Exception:
+                    wait_ms = 20.0
+                time.sleep(max(0.0, wait_ms) / 1000.0)
 
                 # If this was the last active tick, equip tempo tool (slot 6)
                 if idx == last_index:
@@ -1219,7 +1398,11 @@ def play_song_thread():
                     time.sleep(min(step, delay_sec - waited)); waited += min(step, delay_sec - waited)
         prev_tick = tick
 
-    output_text.insert(tk.END, "Playback finished or stopped.\\n")
+    if stopped_by_user:
+        output_text.insert(tk.END, "Playback stopped by user.\\n")
+        return
+
+    output_text.insert(tk.END, "Playback finished.\\n")
 
     # After building all delay blocks, automatically run the tempo tool
     # to set delay times based on computed tick timings.
@@ -1227,12 +1410,29 @@ def play_song_thread():
         apply_tempo_to_delays()
     except Exception as e:
         try:
-            output_text.insert(tk.END, f"Tempo tool error: {e}\\n")
+            output_text.insert(tk.END, f"Tempo tool error: {e}\n")
         except Exception:
             pass
 
 def play_song():
-    global stop_play
+    global stop_play, tempo_tool_pos
+
+    # Require tempo UI position to be captured before starting playback,
+    # otherwise the final tempo-tool step would mis-apply 1.00s delays.
+    if tempo_tool_pos is None:
+        try:
+            messagebox.showwarning(
+                "Tempo UI not captured",
+                "Please capture the tempo UI position (Tempo UI button, then F6) "
+                "before using Play Song, so delay times can be applied correctly.",
+            )
+        except Exception:
+            try:
+                output_text.insert(tk.END, "Tempo UI position not captured; please capture it before Play Song.\n")
+            except Exception:
+                pass
+        return
+
     stop_play = False
     threading.Thread(target=play_song_thread, daemon=True).start()
 
@@ -1240,7 +1440,7 @@ def play_song():
 root = tk.Tk()
 root.title("NBS Overlay Music maker")
 # adjusted default window: a bit narrower, a bit taller
-root.geometry("800x560")
+root.geometry("840x560")
 
 # Output area (smaller)
 output_text = scrolledtext.ScrolledText(root, width=100, height=12)
@@ -1323,12 +1523,12 @@ apply_grid_btn.pack(side="left", padx=6)
 dot_size_var = tk.IntVar(value=2)
 
 # NEW: timing settings (ms)
-move_between_notes_var = tk.DoubleVar(value=5.0)   # ms between note clicks
-move_to_delay_var = tk.DoubleVar(value=400.0)      # ms before moving to delay cell
+move_between_notes_var = tk.DoubleVar(value=5.0)   # ms between note clicks (new default)
+move_to_delay_var = tk.DoubleVar(value=140.0)     # ms after clicking delay cell (new default)
 
 # Wait before tempo tool UI is used (seconds)
 # This gives the game time to show the tool 6 window
-tempo_tool_wait_var = tk.DoubleVar(value=2.0)
+tempo_tool_wait_var = tk.DoubleVar(value=2.5)     # new default 2.5s
 
 # place smaller control widgets
 ctrl2 = tk.Frame(root)
@@ -1343,7 +1543,7 @@ tk.Label(ctrl2, text="Between notes (ms):").pack(side="left", padx=(8,0))
 move_between_spin = tk.Spinbox(ctrl2, from_=0.0, to=1000.0, increment=1.0, width=6, textvariable=move_between_notes_var)
 move_between_spin.pack(side="left", padx=4)
 
-tk.Label(ctrl2, text="To delay (ms):").pack(side="left", padx=(8,0))
+tk.Label(ctrl2, text="Delay (ms after click):").pack(side="left", padx=(8,0))
 move_to_delay_spin = tk.Spinbox(ctrl2, from_=0.0, to=2000.0, increment=1.0, width=6, textvariable=move_to_delay_var)
 move_to_delay_spin.pack(side="left", padx=4)
 
@@ -1354,7 +1554,7 @@ tempo_wait_spin.pack(side="left", padx=4)
 
 # Wiggle controls (new)
 wiggle_amp_var = tk.DoubleVar(value=2.4)  # pixels
-wiggle_count_var = tk.IntVar(value=12)
+wiggle_count_var = tk.IntVar(value=16)
 
 tk.Label(ctrl2, text="Wiggle px:").pack(side="left", padx=(8,0))
 wiggle_amp_spin = tk.Spinbox(ctrl2, from_=0.0, to=20.0, increment=0.5, width=5, textvariable=wiggle_amp_var)
