@@ -8,4 +8,6 @@ select notes and stuff in game
 select delays in game (u need the same number as ticks after loading .nbs)               
 press play song               
 enjoy                  
-Ask mabe if needed  https://discord.gg/km6yD47r      
+Ask me if needed something
+My discord
+mabe5514    
