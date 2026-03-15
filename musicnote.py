@@ -1340,7 +1340,7 @@ def play_song():
 
 # ---------------- GUI construction (compact) ----------------
 root = tk.Tk()
-root.title("NBS Overlay Music maker")
+root.title("Music macro v2.0")
 # adjusted default window: a bit narrower, a bit taller
 root.geometry("700x570")
 
