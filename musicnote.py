@@ -1266,21 +1266,11 @@ def play_song_thread():
                     time.sleep(min(step, delay_sec - waited)); waited += min(step, delay_sec - waited)
         prev_tick = tick
 
-    output_text.insert(tk.END, "Playback finished or stopped.\\n")
+    root.after(0, lambda: output_text.insert(tk.END, "Playback finished or stopped.\n"))
+    root.after(0, lambda: output_text.insert(tk.END, "Build done. Use 'Set Delays' to apply timing.\n"))
 
-    # After building all delay blocks, automatically run the tempo tool
-    # to set delay times based on computed tick timings.
-    # Skip entirely if the user stopped playback with F7.
-    if not stop_play:
-        try:
-            apply_tempo_to_delays()
-        except Exception as e:
-            try:
-                output_text.insert(tk.END, f"Tempo tool error: {e}\\n")
-            except Exception:
-                pass
-    else:
-        output_text.insert(tk.END, "Tempo tool skipped (stopped by F7).\\n")
+
+    
 
 def play_song():
     global stop_play
@@ -1324,6 +1314,11 @@ def play_song():
 
     # ---------------- Live countdown in output (runs in thread) ----------------
     def _countdown_then_play():
+        if tick_positions and len(tick_positions) > 0:
+            x, y = tick_positions[0]
+            move_and_click_abs(x, y)
+            time.sleep(0.1)
+
         for remaining in range(5, 0, -1):
             if stop_play:
                 root.after(0, lambda: output_text.insert(tk.END, "Countdown cancelled.\n"))
@@ -1585,6 +1580,42 @@ tk.Radiobutton(tempo_frame, text="Up (longer)", variable=round_mode_var, value="
 overlay_status_var = tk.StringVar(value="Overlay: hidden")
 status_label = tk.Label(root, textvariable=overlay_status_var)
 status_label.pack(side="left", padx=6)
+
+def run_set_delays():
+    global stop_play
+    stop_play = False
+
+    if minimize_on_play_var.get():
+        try:
+            root.iconify()
+        except Exception:
+            pass
+
+    def _countdown_then_delays():
+        if tick_positions and len(tick_positions) > 0:
+            x, y = tick_positions[0]
+            move_and_click_abs(x, y)
+            time.sleep(0.1)
+
+        for remaining in range(5, 0, -1):
+            if stop_play:
+                root.after(0, lambda: output_text.insert(tk.END, "Countdown cancelled.\n"))
+                return
+            msg = f"Set Delays in {remaining}...  (press F7 to cancel)\n"
+            root.after(0, lambda m=msg: (output_text.insert(tk.END, m), output_text.see(tk.END)))
+            time.sleep(1.0)
+        if not stop_play:
+            equip_tool(6)
+            root.after(0, lambda: (output_text.insert(tk.END, "Setting delays now!\n"), output_text.see(tk.END)))
+            try:
+                apply_tempo_to_delays()
+            except Exception as e:
+                root.after(0, lambda err=e: output_text.insert(tk.END, f"Tempo tool error: {err}\n"))
+
+    threading.Thread(target=_countdown_then_delays, daemon=True).start()
+
+set_delays_btn = tk.Button(root, text="Set Delays", width=12, command=run_set_delays)
+set_delays_btn.pack(side="right", padx=4, pady=6)
 
 play_button = tk.Button(root, text="Play Song", width=12, command=play_song)
 play_button.pack(side="right", padx=8, pady=6)
