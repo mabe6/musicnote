@@ -29,3 +29,4 @@ my own script got flaged by windows lol it's open sorce
 -Capture tempo ui is the screwdriver gui for delays time set i mean the place where you type in the time of the delays with you set with f6 as everyother note
 
 -tempo round is when time is = .055 is decides to set is up to .06 or down .05 makes the song a bit slower/faster
+remember to turn shift lock OFF while using it
