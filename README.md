@@ -22,7 +22,7 @@ my own script got flaged by windows lol it's open sorce
 
 -wiggle px it is the range at which ur mouse will move around the delay try not to change it
 
--wiggle count about of times it will repeat wiggle px move (this setting impacts the time of making a song or setting delays the most of them all)
+-wiggle count of how many times it will repeat wiggle px move (this setting impacts the time of making a song or setting delays the most of them all)
 
 -skew x,y helps alling the dots which is needed to guide when macro has to click also turn show grid on
 
