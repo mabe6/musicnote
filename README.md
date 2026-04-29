@@ -1,6 +1,6 @@
 How to use:
-coming soon
-no tutorial yet
+Tutorial by https://www.youtube.com/@cookieistheb3st 
+https://www.youtube.com/watch?v=kC2M0NdMaAI
 Ask me if needed something
 My discord
 mabe5514    
