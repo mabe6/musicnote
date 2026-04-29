@@ -28,7 +28,7 @@ my own script got flaged by windows lol it's open sorce
 
 -wiggle count of how many times it will repeat wiggle px move (this setting impacts the time of making a song or setting delays the most of them all)
 
--skew x,y helps alling the dots which is needed to guide when macro has to click also turn show grid on
+-skew x,y helps alling the dots which is needed to guide where macro has to click also turn show grid on
 
 -Capture tempo ui is the screwdriver gui for delays time set i mean the place where you type in the time of the delays with you set with f6 as everyother note
 
