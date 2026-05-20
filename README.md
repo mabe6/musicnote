@@ -10,7 +10,7 @@ My discord
 mabe5514    
 my own script got flaged by windows lol it's open sorce
 
--use f6 to select
+-use f6 to select, f7 to stop
 
 -top left and bottom right are there so you can select your place where you set a grid of delays top left and bottom right make sure you make them into square grid or rectangle grid not someting else. (yes u still need to --select bottom right just like if u wouldt have few delays doesnt mean u dont have to select it as a square/rectangle!!!)
 
