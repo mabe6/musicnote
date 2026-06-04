@@ -79,6 +79,7 @@ columns_override = None
 rows_override = None
 notes_by_tick = {}
 tempo = 0.0
+tempo_changes = {}  # tick -> t/s; built from "Tempo Changer" custom instrument notes
 stop_play = False
 last_overlay_mapping = None
 # Precomputed tick absolute positions (len = song_ticks) or None
@@ -127,6 +128,19 @@ def instrument_to_name(inst):
             8:"Xylophone",9:"Iron Xylophone",10:"Cow Bell",
             11:"Didgeridoo",12:"Bit",13:"Banjo",14:"Pling"}.get(inst, f"Unknown({inst})")
 
+def get_tempo_at(tick):
+    """Return effective tempo in t/s at the given tick.
+    Falls back to base header tempo if no Tempo Changer notes exist before this tick.
+    """
+    if not tempo_changes:
+        return tempo
+    current = tempo
+    for t in sorted(tempo_changes):
+        if t <= tick:
+            current = tempo_changes[t]
+        else:
+            break
+    return current if current > 0 else tempo
 
 def quantize_delay_to_step(value, step=0.01, minimum=0.05):
     """Quantize a delay (seconds) to the given step using current round mode.
@@ -386,16 +400,29 @@ def load_nbs():
 
     notes_by_tick.clear()
     max_tick = 0
+
+    global tempo_changes
+    tempo_changes = {}
+    try:
+        tempo_changer_ids = set()
+        for idx, inst in enumerate(song.instruments):
+            if getattr(inst, 'name', '') == 'Tempo Changer':
+                tempo_changer_ids.add(16 + idx)
+        for n in song.notes:
+            if n.instrument in tempo_changer_ids:
+                tempo_changes[n.tick] = n.pitch / 15.0
+    except Exception as e:
+        output_text.insert(tk.END, f"Tempo Changer scan skipped: {e}\n")
+
     for n in song.notes:
         if NOTE_MIN <= n.key <= NOTE_MAX:
-            notes_by_tick.setdefault(n.tick, []).append(n)
-            if n.tick > max_tick:
-                max_tick = n.tick
+            if n.instrument not in tempo_changer_ids:  # skip Tempo Changer notes
+                notes_by_tick.setdefault(n.tick, []).append(n)
+                if n.tick > max_tick:
+                    max_tick = n.tick
 
-    # ✅ Fix: some NBS files set header_length wrong, so include last tick
     song_ticks = max(header_length, max_tick + 1)
 
-    # Build compressed tick mapping: only ticks that actually contain notes
     active_ticks = [t for t in range(song_ticks) if notes_by_tick.get(t)]
     active_tick_index = {t: i for i, t in enumerate(active_ticks)}
 
@@ -407,15 +434,13 @@ def load_nbs():
     output_text.insert(tk.END, "Tick | Delay(s) | Notes\n")
     output_text.insert(tk.END, "-" * 60 + "\n")
 
-    # Show every tick. Empty ticks display 0.0000 — their time is carried forward
-    # and added to the next tick that has notes (shown as the full accumulated delay).
     accumulated = 0
     for tick in range(song_ticks):
         notes_in_tick = notes_by_tick.get(tick, [])
         if notes_in_tick:
-            # this tick absorbs all accumulated empty-tick time plus its own 1 tick
             gap_ticks = accumulated + 1
-            delay_sec = gap_ticks / tempo if tempo > 0 else 0.0
+            effective_bpm = get_tempo_at(tick)
+            delay_sec = gap_ticks / effective_bpm if effective_bpm > 0 else 0.0
             notes_str = ", ".join([
                 f"(L{n.layer}, {instrument_to_name(n.instrument)}, {key_to_note_name(n.key)})"
                 for n in notes_in_tick
@@ -428,11 +453,14 @@ def load_nbs():
 
     output_text.insert(tk.END, "-" * 60 + "\n")
 
+    if tempo_changes:
+        output_text.insert(tk.END, f"\nTempo Changer: {len(tempo_changes)} change(s) detected.\n")
+        for t, ts in sorted(tempo_changes.items()):
+            output_text.insert(tk.END, f"  tick {t}: {ts*15:.0f} BPM ({ts:.4f} t/s)\n")
+
     compute_required_counts()
 
-    # update mapping regardless of overlay visibility (this is the key: mapping exists while overlay hidden)
     update_mapping()
-    # update overlay if it's visible
     root.after(0, update_or_create_overlay)
 
 # ---------------- Capture handlers ----------------
@@ -1036,7 +1064,8 @@ def apply_tempo_to_delays():
         else:
             prev_tick = active_ticks[idx - 1]
             gap_ticks = max(1, tick - prev_tick)
-        delay_sec = gap_ticks / tempo
+        effective_bpm = get_tempo_at(tick)
+        delay_sec = gap_ticks / effective_bpm if effective_bpm > 0 else gap_ticks / tempo
         delays.append(delay_sec)
 
     # Quantize each delay to game resolution and group by value
@@ -1191,7 +1220,8 @@ def play_song_thread():
             break
 
         notes_in_tick = notes_by_tick.get(tick, [])  # should always be non-empty here
-        delay_sec = (tick - prev_tick) / tempo if tempo > 0 else 0.0
+        effective_bpm = get_tempo_at(tick)
+        delay_sec = (tick - prev_tick) / effective_bpm if effective_bpm > 0 else 0.0
 
         if notes_in_tick:
             needed_by_name = {}
@@ -1335,7 +1365,7 @@ def play_song():
 
 # ---------------- GUI construction (compact) ----------------
 root = tk.Tk()
-root.title("Music macro v2.0")
+root.title("Music macro v2.1")
 # adjusted default window: a bit narrower, a bit taller
 root.geometry("700x570")
 
@@ -1727,3 +1757,4 @@ if __name__ == "__main__":
 
     # Start the GUI main loop
     root.mainloop()
+    
